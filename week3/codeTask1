@@ -11,11 +11,11 @@ void setup() {
 }
 
 void loop() {
-  // Read potentiometer and send value to Python
+
   potValue = analogRead(potPin);
   Serial.println(potValue);
   
-  // Check if Python sent a command
+  
   if (Serial.available() > 0) {
     command = Serial.readStringUntil('\n');
     command.trim();
@@ -27,7 +27,7 @@ void loop() {
     }
   }
 
-  // No delay here — Arduino updates as fast as it can
+  
 }
 
 
@@ -36,8 +36,8 @@ python:
 import serial
 import time
 
-ser = serial.Serial('COM7', 9600, timeout=0.1)  # short timeout
-time.sleep(2)  # wait for Arduino to initialize
+ser = serial.Serial('COM7', 9600, timeout=0.1)  
+time.sleep(2)  
 
 try:
     while True:
@@ -46,7 +46,7 @@ try:
             pot_value = int(line)
             print("Potentiometer Value:", pot_value)
 
-            # Immediately send LED command
+            
             if pot_value > 512:
                 ser.write(b"ON\n")
             else:
