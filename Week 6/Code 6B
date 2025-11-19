@@ -39,8 +39,8 @@ Servo myservo; // <-- MODIFICATION: Create Servo object
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char* ssid = "hehehe";
-const char* password = "12345678";
+const char* ssid = "Adam";
+const char* password = "mudahmung";
 
 void startCameraServer();
 void setupLedFlash(int pin);
