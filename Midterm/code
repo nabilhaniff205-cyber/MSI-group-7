@@ -1,0 +1,412 @@
+Master:
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+// Sender inputs
+const int POT_PIN = 34;
+const int TRIG_PIN = 5;
+const int ECHO_PIN = 18;
+
+// Receiver MAC (replace with receiver's MAC printed on boot)
+uint8_t receiverMac[] = {0xEC, 0xE3, 0x34, 0x9A, 0x1E, 0xA8};
+
+struct Payload {
+  uint16_t pot;
+  float distanceCm;
+};
+
+unsigned long lastSendMillis = 0;
+
+// --- smoothing graph parameters ---
+float smoothedDistance = 0.0;
+float smoothedPot = 0.0;
+const float alphaDist = 0.2;  // for ultrasonic
+const float alphaPot  = 0.1;  // for potentiometer (smaller = smoother)
+
+// Callback (keep clean for Serial Plotter)
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) { }
+
+// ---------- send manual command ----------
+void sendManualCommand(char c) {
+  esp_now_send(receiverMac, reinterpret_cast<uint8_t *>(&c), 1);
+}
+
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30 ms (~5 m)
+  if (duration == 0) return -1.0f;
+  return duration * 0.0343f / 2.0f;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while (1) delay(100);
+  }
+
+  esp_now_register_send_cb(onDataSent);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+}
+
+void loop() {
+
+  // ---------- Manual command input ----------
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == 'R' || c == 'r' ||
+        c == 'G' || c == 'g' ||
+        c == 'B' || c == 'b' ||
+        c == 'V' || c == 'v' ||
+        c == 'A' || c == 'a') {
+
+      sendManualCommand(c);
+      Serial.print("Sent manual command: ");
+      Serial.println(c);
+    }
+  }
+
+  // --- Smooth potentiometer input ---
+  int rawPot = analogRead(POT_PIN);
+  smoothedPot = alphaPot * rawPot + (1 - alphaPot) * smoothedPot;
+
+  // --- Smooth ultrasonic reading ---
+  float newDist = readDistanceCm();
+  if (newDist > 0) {
+    smoothedDistance = alphaDist * newDist + (1 - alphaDist) * smoothedDistance;
+  }
+
+  // Map smoothed potentiometer to threshold range (5–100 cm)
+  float thresholdCm = map((int)smoothedPot, 0, 4095, 5, 100);
+
+  // --- Prepare data for plotting ---
+  Serial.print("Distance(cm):");
+  Serial.print(smoothedDistance, 2);
+  Serial.print(",");
+  Serial.print("Threshold(cm):");
+  Serial.println(thresholdCm, 2);
+
+  // --- RGB & Vibration status output (Serial only) ---
+  if (smoothedDistance < thresholdCm && smoothedDistance > 0) {
+    Serial.println("RGB: RED, Vibration: ON");
+  } else {
+    Serial.println("RGB: GREEN, Vibration: OFF");
+  }
+
+  // --- Send data via ESP-NOW ---
+  Payload payload = {};
+  payload.pot = (uint16_t)smoothedPot;
+  payload.distanceCm = smoothedDistance;
+
+  if (millis() - lastSendMillis >= 100) {
+    esp_now_send(receiverMac, reinterpret_cast<uint8_t *>(&payload), sizeof(payload));
+    lastSendMillis = millis();
+  }
+
+  delay(100);
+}
+
+
+Slave:
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+/* =========================================================
+   PIN DEFINITIONS (Actuators / Outputs)
+   ========================================================= */
+// RGB LED pins used to indicate system state
+const int RED_PIN   = 25;
+const int GREEN_PIN = 26;
+const int BLUE_PIN  = 27;
+
+// Vibration motor pin used for tactile feedback
+const int VIB_PIN   = 16;
+
+/* =========================================================
+   DATA STRUCTURE FOR ESP-NOW AUTO MODE
+   ========================================================= */
+// Payload structure received from sender ESP32
+// pot        : potentiometer value (used to set distance threshold)
+// distanceCm : measured distance from ultrasonic sensor
+struct Payload {
+  uint16_t pot;
+  float distanceCm;
+};
+
+/* =========================================================
+   GLOBAL STATE VARIABLES
+   ========================================================= */
+// Indicates whether system is in manual mode or auto mode
+volatile bool manualMode = false;
+
+// Stores vibration ON/OFF state in manual mode
+bool manualVibOn = false;
+
+/* =========================================================
+   FUNCTION DECLARATION
+   ========================================================= */
+// Forward declaration so function can be used before definition
+void handleSerialCommand(char c);
+
+/* =========================================================
+   ACTUATOR CONTROL FUNCTIONS
+   ========================================================= */
+
+// Sets RGB LED color based on boolean inputs
+void setColor(bool r, bool g, bool b) {
+  digitalWrite(RED_PIN,   r ? HIGH : LOW);
+  digitalWrite(GREEN_PIN, g ? HIGH : LOW);
+  digitalWrite(BLUE_PIN,  b ? HIGH : LOW);
+}
+
+// Turns vibration motor ON or OFF
+void setVibration(bool on) {
+  digitalWrite(VIB_PIN, on ? HIGH : LOW);
+}
+
+/* =========================================================
+   SENSOR DATA PROCESSING
+   ========================================================= */
+
+// Converts potentiometer reading (0–4095) to distance threshold (5–100 cm)
+float potToThresholdCm(uint16_t pot) {
+  return 5.0f + (pot / 4095.0f) * 95.0f;
+}
+
+/* =========================================================
+   ESP-NOW RECEIVE CALLBACK FUNCTION
+   ========================================================= */
+// This function is automatically called when ESP-NOW data is received
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+
+  /* ---------- MANUAL COMMAND VIA ESP-NOW ---------- */
+  // If received data length is 1 byte, it is treated as a manual command
+  if (len == 1) {
+    char cmd = (char)incomingData[0];
+    handleSerialCommand(cmd);  // Process command using same logic as Serial input
+    return;
+  }
+
+  /* ---------- AUTO MODE OPERATION ---------- */
+  // Ignore sensor data if system is currently in manual mode
+  if (manualMode) return;
+
+  // Ignore invalid packet sizes
+  if (len != sizeof(Payload)) return;
+
+  // Copy received data into payload structure
+  Payload payload = {};
+  memcpy(&payload, incomingData, sizeof(payload));
+
+  // Convert potentiometer value to distance threshold
+  float threshold = potToThresholdCm(payload.pot);
+
+  // Decision logic based on measured distance
+  if (payload.distanceCm > 0 && payload.distanceCm <= threshold) {
+    // Obstacle detected within threshold
+    setColor(true, false, false);   // Red LED
+    setVibration(true);             // Vibration ON
+  } else {
+    // No obstacle detected
+    setColor(false, true, false);   // Green LED
+    setVibration(false);            // Vibration OFF
+  }
+}
+
+/* =========================================================
+   MANUAL COMMAND HANDLER (SERIAL + ESP-NOW)
+   ========================================================= */
+// Handles user input commands for manual control
+void handleSerialCommand(char c) {
+  switch (c) {
+
+    case 'B':
+    case 'b':
+      manualMode = true;
+      manualVibOn = false;
+      setColor(false, false, true);   // Blue LED
+      setVibration(false);
+      Serial.println("Manual: Blue");
+      break;
+
+    case 'R':
+    case 'r':
+      manualMode = true;
+      manualVibOn = false;
+      setColor(true, false, false);   // Red LED
+      setVibration(false);
+      Serial.println("Manual: Red");
+      break;
+
+    case 'G':
+    case 'g':
+      manualMode = true;
+      manualVibOn = false;
+      setColor(false, true, false);   // Green LED
+      setVibration(false);
+      Serial.println("Manual: Green");
+      break;
+
+    case 'V':
+    case 'v':
+      manualMode = true;
+      manualVibOn = !manualVibOn;     // Toggle vibration
+      setVibration(manualVibOn);
+      Serial.println(manualVibOn ? "Manual: Vibration ON"
+                                 : "Manual: Vibration OFF");
+      break;
+
+    case 'A':
+    case 'a':
+      manualMode = false;             // Return to auto mode
+      manualVibOn = false;
+      setVibration(false);
+      Serial.println("Auto mode");
+      break;
+
+    default:
+      Serial.println("Commands: B/R/G/V (manual), A (auto)");
+      break;
+  }
+}
+
+/* =========================================================
+   SETUP FUNCTION
+   ========================================================= */
+void setup() {
+  Serial.begin(115200);
+
+  // Configure actuator pins as outputs
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BLUE_PIN, OUTPUT);
+  pinMode(VIB_PIN, OUTPUT);
+
+  // Ensure all outputs start OFF
+  setColor(false, false, false);
+  setVibration(false);
+
+  // Initialize ESP32 in station mode for ESP-NOW
+  WiFi.mode(WIFI_STA);
+
+  // Print receiver MAC address for sender configuration
+  Serial.print("Receiver MAC (put this in sender): ");
+  Serial.println(WiFi.macAddress());
+
+  // Initialize ESP-NOW communication
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    while (1) delay(100); // Halt if initialization fails
+  }
+
+  // Register callback function for receiving ESP-NOW data
+  esp_now_register_recv_cb(onDataRecv);
+
+  Serial.println("Receiver ready. Commands via Serial or ESP-NOW: B/R/G/V/A");
+}
+
+/* =========================================================
+   MAIN LOOP
+   ========================================================= */
+void loop() {
+
+  // Check for manual commands via Serial Monitor
+  if (Serial.available() > 0) {
+    char c = static_cast<char>(Serial.read());
+    handleSerialCommand(c);
+  }
+
+  delay(10); // Small delay for stability
+}
+
+Python untuk graph:
+
+import serial
+import matplotlib.pyplot as plt
+import time
+
+# -------- SERIAL SETTINGS --------
+PORT = 'COM7'        # 🔴 CHANGE THIS
+BAUD = 115200
+
+ser = serial.Serial(PORT, BAUD, timeout=1)
+time.sleep(2)  # allow ESP32 to reset
+
+# -------- DATA STORAGE --------
+distance_data = []
+threshold_data = []
+time_data = []
+
+start_time = time.time()
+
+# -------- PLOT SETUP --------
+plt.ion()  # interactive mode
+fig, ax = plt.subplots()
+
+line1, = ax.plot([], [], label="Distance (cm)")
+line2, = ax.plot([], [], label="Threshold (cm)")
+
+ax.set_xlabel("Time (s)")
+ax.set_ylabel("Distance (cm)")
+ax.set_title("ESP32 Distance Monitoring")
+ax.legend()
+ax.grid(True)
+
+# -------- MAIN LOOP --------
+while True:
+    try:
+        line = ser.readline().decode().strip()
+
+        if "Distance(cm)" in line:
+            # Example line:
+            # Distance(cm):34.52,Threshold(cm):50.00
+
+            parts = line.split(',')
+            dist = float(parts[0].split(':')[1])
+            thresh = float(parts[1].split(':')[1])
+
+            current_time = time.time() - start_time
+
+            time_data.append(current_time)
+            distance_data.append(dist)
+            threshold_data.append(thresh)
+
+            # Limit data points (for performance)
+            time_data = time_data[-100:]
+            distance_data = distance_data[-100:]
+            threshold_data = threshold_data[-100:]
+
+            # Update plot
+            line1.set_data(time_data, distance_data)
+            line2.set_data(time_data, threshold_data)
+
+            ax.relim()
+            ax.autoscale_view()
+
+            plt.pause(0.01)
+
+    except KeyboardInterrupt:
+        print("Plot stopped by user")
+        break
