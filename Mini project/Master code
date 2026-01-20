@@ -18,10 +18,10 @@ const int SDA_PIN = 21;
 const int SCL_PIN = 22;
 
 // WiFi + Telegram
-const char *WIFI_SSID = "Fal's";
-const char *WIFI_PASSWORD = "nopal2204";
-const char *TELEGRAM_TOKEN = "7685157517:AAE092DtAnTKZTQ8u7brM8hrgFKW3yvM_fY";
-const char *TELEGRAM_CHAT_ID = "717948699";
+const char *WIFI_SSID = //"wifi id";
+const char *WIFI_PASSWORD = //"wifi password";
+const char *TELEGRAM_TOKEN = //"insert telegram token here";
+const char *TELEGRAM_CHAT_ID = //"insert telegram chat id here";
 uint8_t receiverMac[] = {0xEC, 0xE3, 0x34, 0x9A, 0x1E, 0xA8};
 
 // Face state handling
